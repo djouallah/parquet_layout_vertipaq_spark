@@ -1,0 +1,10 @@
+{
+  "name": "vertipaq-delta-layout",
+  "version": "0.1.0",
+  "description": "How to configure Databricks (cluster spark_conf, Delta table properties, CLUSTER BY on one key) so the Delta tables it writes are in the parquet layout Power BI Direct Lake / VertiPaq transcodes fast and holds small.",
+  "author": {
+    "name": "mim",
+    "url": "https://github.com/djouallah/parquet_layout_vertipaq_spark"
+  },
+  "homepage": "https://github.com/djouallah/parquet_layout_vertipaq_spark"
+}

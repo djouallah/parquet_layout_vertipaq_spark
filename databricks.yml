@@ -1,0 +1,269 @@
+# tpcds_layout -- what layout does VertiPaq prefer, and can a Databricks team reach it from
+# CONFIGURATION ALONE? The spark_conf on tpcds_build_spark IS the deliverable; the user's code stays
+# df.write.saveAsTable(). Two jobs plus a probe:
+#
+#   tpcds_generate      DuckDB dsdgen -> Volume databricks_ne.tpcds_raw.landing/sf{N}. Once per SF.
+#   tpcds_build_spark   the three arms, from ONE notebook under ONE spark_conf. `ordering` is the
+#                       only thing that varies:
+#                         --var=ordering=none      plain saveAsTable       -> tpcds_sf{N}_default
+#                         --var=ordering=cluster   + CLUSTER BY on the key -> tpcds_sf{N}_cluster
+#                       `default` IS the recipe: ordering none, the spark_conf below, nothing else.
+#                       It needs no flag of its own because it is what the job does when asked for
+#                       nothing. Two variables make a DIFFERENT arm whose name carries the number
+#                       (never a silent variant of the recipe):
+#                         --var=rows_per_file=8000000                     -> tpcds_sf{N}_defaultf8
+#                         --var=ordering=cluster --var=compression=snappy -> tpcds_sf{N}_clustersn
+#   tpcds_rowgroup_probe  which writer knob actually states a row-group size (SF10, minutes)
+#
+#   export DATABRICKS_TF_EXEC_PATH=C:/Users/<you>/bin/terraform.exe
+#   databricks bundle deploy -p ontobricks --var=scale_factor=100 --var=ordering=cluster
+#   databricks bundle run  tpcds_build_spark -p ontobricks --var=scale_factor=100 --var=ordering=cluster
+#
+# `ordering` MUST be on the DEPLOY. The notebook task reads it from base_parameters, which are
+# resolved when the bundle is deployed -- `--var` on `bundle run` alone does NOT override them, it
+# just re-resolves the name. Passing it only to `run` silently builds whatever arm was last
+# deployed: it cost one SF1000 run that reported one arm on the command line, wrote another arm's
+# schema, and died on a table that already existed. Check the deployed job's NAME (it
+# carries the arm) before running.
+#
+# Serverless job compute is disabled in this workspace, so everything runs on classic job clusters.
+# `bundle deploy` needs DATABRICKS_TF_EXEC_PATH pointed at a local terraform (CLI v0.294's own
+# download fails signature verification).
+
+bundle:
+  name: tpcds_layout
+
+sync:
+  exclude:
+    - "*.pdf"
+    - "fabric/**"
+    - "README.md"
+    - "RUN.md"
+    - ".gitignore"
+
+variables:
+  catalog:
+    description: Unity Catalog catalog everything lands in.
+    default: databricks_ne
+  scale_factor:
+    description: TPC-DS scale factor. 10 = smoke test (26M-row store_sales after customisation), 100 = the paper's tipping point (262M), 1000 = 2.6B (needs F128 on the Fabric side).
+    default: 100
+  raw_schema:
+    description: Schema holding the `landing` Volume with the raw dsdgen Parquet (one folder per SF) and the build report table. Never mirrored.
+    default: tpcds_raw
+  ordering:
+    description: THE variable, and the only difference between the arms. `none` writes plain saveAsTable and IS the recipe (schema tpcds_sf{N}_default), `cluster` declares CLUSTER BY on the date key and appends (tpcds_sf{N}_cluster), `partition` uses partitionBy on the date key and nothing else -- the paper's Fabric arm's GEOMETRY, minus V-Order and minus any in-file ordering (an OPTIMIZE commits nothing when every partition already holds one file, and the sort that stood in for it never reached the parquet -- LEARNING.md), one file per date, the row cap inert (tpcds_sf{N}_partition). Everything else about the write is identical, which is what makes any measured difference attributable to the ordering.
+    default: none
+  arm_schema:
+    description: Schema the arm is written to. Empty = tpcds_sf{scale_factor}_{default|cluster|partition}, derived from `ordering` so the two cannot disagree. Same table names as every other arm; the build never overwrites an existing table.
+    default: ""
+  order_keys:
+    description: JSON {table -> column} for the CLUSTER BY / PARTITIONED BY key. Empty = the date surrogate key on each fact (ss_sold_date_sk, cs_sold_date_sk). ONE key deliberately - it is the only key that eliminates row groups, and with two or more keys liquid clustering switches to a space-filling curve, which would stop the arm being one key's ordering.
+    default: ""
+  compression:
+    description: 'Parquet codec, as the TABLE property delta.parquet.compression.codec. Empty is the recipe -- DBR 19 stamps zstd itself. `snappy` exists to reproduce the delta_rs arm, which writes SNAPPY and cannot be told otherwise; bytes between a snappy arm and a zstd arm are not comparable. A codec change is a DIFFERENT ARM and the suffix carries it (snappy -> ...sn).'
+    default: ""
+  rows_per_file:
+    description: Rows per FILE -- spark.sql.files.maxRecordsPerFile -- and THE geometry lever. With no row-group cap in the recipe the file close ends the row group, so this number IS the VertiPaq segment size and must sit inside the 1M-16M window. 6000000 is the recipe. Anything else is a DIFFERENT ARM and the schema suffix carries it (8000000 -> tpcds_sf{N}_defaultf8), so two builds of one arm can never differ silently. Unordered arms only -- the cap is inert on a clustered write, where the clustering exchange sizes files in bytes, and far above a date's rows on a partitioned one; build_spark.py refuses it elsewhere.
+    default: 6000000
+  spark_version:
+    description: Always the newest runtime this workspace offers (`databricks clusters spark-versions`), never an LTS. 19 ships parquet-mr 1.17.0-databricks-0001.
+    default: 19.x-scala2.13
+  gen_node_type:
+    description: Single node running DuckDB dsdgen. dsdgen materialises all 24 tables in memory, so SF100 wants ~256 GB RAM and a big local disk to spill to.
+    default: Standard_E32ds_v5
+  build_node_type:
+    description: Worker/driver type of the build. The parquet-mr writer buffers one full row group (up to the 2 GiB block size) per task, so keep >= 8 GB RAM per core.
+    default: Standard_E8ds_v5
+  build_workers:
+    default: 4
+
+resources:
+  jobs:
+    tpcds_generate:
+      name: tpcds sf${var.scale_factor} generate (dsdgen)
+      tasks:
+        - task_key: generate
+          job_cluster_key: gen
+          libraries:
+            - pypi:
+                package: duckdb
+          notebook_task:
+            notebook_path: ./notebooks/generate_tpcds.py
+            base_parameters:
+              catalog: ${var.catalog}
+              raw_schema: ${var.raw_schema}
+              scale_factor: ${var.scale_factor}
+              force: "false"
+      job_clusters:
+        - job_cluster_key: gen
+          new_cluster:
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.gen_node_type}
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            single_user_name: ${workspace.current_user.userName}
+            spark_conf:
+              spark.master: "local[*]"
+              spark.databricks.cluster.profile: singleNode
+            custom_tags:
+              ResourceClass: SingleNode
+
+    # ONE build job for all three arms. The spark_conf below IS the deliverable: every arm is
+    # written under it byte-for-byte, and the only thing that varies is the `ordering` parameter
+    # (none | cluster | partition). Three separate jobs drifted into different row-group targets,
+    # block sizes, page settings and compression, which made a layout comparison a comparison of
+    # five config changes at once. Run it three times, once per arm:
+    #   databricks bundle deploy -p ontobricks --var=ordering=none   # the arm is set HERE
+    #   databricks bundle run    tpcds_build_spark -p ontobricks --var=ordering=none
+    tpcds_build_spark:
+      # The name carries every deploy-time value the arm depends on: base_parameters resolve at
+      # DEPLOY, so the name is the one place the deployed job says which arm it will write.
+      name: tpcds sf${var.scale_factor} build ${var.ordering} arm, rows_per_file=${var.rows_per_file} compression=${var.compression} (one config, ordering is the variable)
+      tasks:
+        - task_key: build_spark
+          job_cluster_key: build
+          notebook_task:
+            notebook_path: ./notebooks/build_spark.py
+            base_parameters:
+              catalog: ${var.catalog}
+              raw_schema: ${var.raw_schema}
+              scale_factor: ${var.scale_factor}
+              ordering: ${var.ordering}
+              arm_schema: ${var.arm_schema}
+              order_keys: ${var.order_keys}
+              rows_per_file: ${var.rows_per_file}
+              compression: ${var.compression}
+      job_clusters:
+        - job_cluster_key: build
+          new_cluster:
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.build_node_type}
+            driver_node_type_id: ${var.build_node_type}
+            num_workers: ${var.build_workers}
+            # Photon OFF: parquet-mr is the writer that honours the parquet.* keys below.
+            runtime_engine: STANDARD
+            data_security_mode: SINGLE_USER
+            single_user_name: ${workspace.current_user.userName}
+            spark_conf:
+              # ---- geometry: ONE number, in ROWS -------------------------------------------
+              #
+              #   6,000,000   rows per FILE -> maxRecordsPerFile, and the file close ends the
+              #                                row group, so one file = one row group = one
+              #                                VertiPaq segment
+              #
+              # Rows, not bytes, so the same segment comes out of a 5-column table and a
+              # 200-column one. NOT set: any byte target. On a clustered write the clustering
+              # exchange sizes files in bytes on its own and the row cap sits below the cut;
+              # delta.targetFileSize = 128 MB as a table property lifts the wide fact's dictionary
+              # (80 -> 97 %) and was measured to change nothing else, so it is an option for a
+              # wider fact, never a line here (the session form overrides the row cap on EVERY
+              # write -- measured at SF10).
+              #
+              # parquet.block.row.count.limit is NOT here, and that is a decision, not an
+              # oversight. It cuts the row group directly, so it can put several groups inside one
+              # file -- and that capability measured worth NOTHING: the arm that used it (6M
+              # groups, two to a 12M file) tied the arm that did not (6M groups, one per file),
+              # 10.0 / 8.1 s against 9.4 / 7.9 at SF100. What it costs is portability: it needs
+              # parquet-java 1.16 (DBR 19, Fabric Runtime 2.0) and every older runtime ACCEPTS IT
+              # AND IGNORES IT, which reads as "row groups did not help". maxRecordsPerFile has
+              # been in Spark since 2.2. Nothing measured, one thing risked -- so it is out.
+              #
+              # The only config-level knob that REPARTITIONS regardless of the user's DataFrame.
+              spark.databricks.delta.optimizeWrite.enabled: "true"
+              # MiB of SHUFFLE bytes per TASK. Not a geometry knob now that the row cap is set --
+              # it decides only how many FILES a task writes, and therefore how many ragged
+              # tails there are (one per task: ~49 at SF1000 store_sales, unchanged by this switch).
+              spark.databricks.delta.optimizeWrite.binSize: "4096"
+              # Rows per FILE, and THE geometry lever: with no row-group cap the file close ends
+              # the group, so this number IS the segment size. Inside Direct Lake's 1M-16M window.
+              # Bytes still track column width -- a full file is ~195 MB on store_sales (35 B/row)
+              # and ~310 MB on the 34-column catalog_sales (57 B/row) at SF100 -- which is the
+              # point of denominating it in rows: the bound holds on any table shape.
+              spark.sql.files.maxRecordsPerFile: "${var.rows_per_file}"
+              # 2 GiB so BYTES never close a row group before the row cap does -- the second line of
+              # the geometry, and the same idea as the first: if this fires first it takes the
+              # decision away from the row count. parquet-mr checks it against BUFFERED bytes, and
+              # with 64 MB pages 1 GiB split the wider fact at ~4.97M rows. Set high to be inert.
+              # This one is NOT optional now that the file cap is the only other geometry line: it
+              # is what keeps a 6M-row file from arriving as two byte-cut row groups.
+              spark.hadoop.parquet.block.size: "2147483648"
+              # ---- writer memory, NOT part of the layout ----------------------------------------
+              # 4 concurrent writer tasks per executor instead of one per core. This changes nothing
+              # about the files: same bins, same row cap, same page budgets, byte-identical output.
+              # It exists because the page budgets above are per COLUMN -- 64 MB page + 64 MB
+              # dictionary -- so a 34-column catalog_sales task buffers 2-4 GB, and 16 of those at
+              # once (one per core on an E16) OOM the executor. Measured at SF1000: store_sales (23
+              # columns) wrote fine and catalog_sales died with exit 52 on every node size tried.
+              spark.task.cpus: "4"
+              # ---- dictionary encoding on every column -----------------------------------------
+              # THE dictionary fix, default 20000. parquet-mr decides dictionary-vs-plain ONCE per
+              # column chunk, on the FIRST page, and falls back unless (encoded + dictionary) < raw.
+              # A page closes at page.size bytes OR this many rows, so by default the dictionary's
+              # whole cost is charged against 20k values and a wide column loses every time.
+              # Measured: 37-39% of fact bytes dictionary-encoded before, 99.7-99.9% after.
+              spark.hadoop.parquet.page.row.count.limit: "16000000"
+              # The other page-closing trigger, default 1 MB (~262k INT32s) -- same reason.
+              spark.hadoop.parquet.page.size: "67108864"
+              # The dictionary's size budget, default 1 MB. Not what was failing before, but now
+              # that a page can hold 16M rows the dictionary itself can exceed 1 MB.
+              spark.hadoop.parquet.dictionary.page.size: "67108864"
+              # Already the default; stated so the recipe declares its intent.
+              spark.hadoop.parquet.enable.dictionary: "true"
+              # ---- Delta protocol, stamped on every NEW table -----------------------------------
+              # LOAD-BEARING: VertiPaq cannot read a v2 checkpoint at all. Liquid clustering turns
+              # it on by default from DBR 14.1, so it must be pinned before any CLUSTER BY.
+              spark.databricks.delta.properties.defaults.checkpointPolicy: classic
+              # Deletion vectors are deliberately NOT set here: DBR 19 defaults them ON and that is
+              # now the intent. Turning them off (this recipe used to) keeps minReaderVersion at 1
+              # for the benefit of Delta readers that cannot do DVs, and charges the difference to
+              # Direct Lake: without DVs a DELETE/UPDATE/MERGE reverts to copy-on-write and rewrites
+              # whole parquet files, so VertiPaq re-transcodes every column in them. With a DV the
+              # files are untouched and the segments already in memory survive. Reader v3 is the
+              # price, paid on purpose.
+              spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite: "true"
+              # A background compaction rewrites the files with ITS own sizing -- the one thing that
+              # silently undoes everything above. Also needs DISABLE PREDICTIVE OPTIMIZATION. This
+              # table property is the only auto-compaction line in the recipe; the session switch
+              # spark.databricks.delta.autoCompact.enabled was dropped 2026-09-07 (measured: no
+              # observable effect either way, and the table property is what a table keeps).
+              spark.databricks.delta.properties.defaults.autoOptimize.autoCompact: "false"
+              # Compression is deliberately NOT set: DBR 19 stamps zstd itself, and forcing snappy on
+              # one arm made every cross-arm comparison compare snappy against zstd.
+
+    tpcds_rowgroup_probe:
+      name: parquet row-group geometry probe
+      tasks:
+        - task_key: rowgroup_probe
+          job_cluster_key: probe
+          notebook_task:
+            notebook_path: ./notebooks/rowgroup_probe.py
+            base_parameters:
+              catalog: ${var.catalog}
+              raw_schema: ${var.raw_schema}
+              scale_factor: "10"          # 26.2M rows: real widths, ~5 files, minutes not hours
+              table: store_sales
+              rows_per_group: ""          # empty -> 6M, or 16M at SF1000
+              keep_output: "false"
+      job_clusters:
+        - job_cluster_key: probe
+          new_cluster:
+            spark_version: ${var.spark_version}
+            node_type_id: ${var.build_node_type}
+            num_workers: 0                # single node: 8 cores is enough to show the tail effect
+            # Photon OFF, as everywhere here: parquet-mr is the writer under test.
+            runtime_engine: STANDARD
+            data_security_mode: SINGLE_USER
+            single_user_name: ${workspace.current_user.userName}
+            spark_conf:
+              spark.master: "local[*, 4]"
+              spark.databricks.cluster.profile: singleNode
+            custom_tags:
+              ResourceClass: SingleNode
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      host: https://adb-6359542001539937.17.azuredatabricks.net

@@ -1,0 +1,30 @@
+.databricks/
+logs/
+.env
+.venv/
+*.json
+!variables/*.json
+__pycache__/
+
+# duckrun's local spill directory -- scratch, never source
+.duckrun_spill/
+
+# The `*.json` rule above is for credential/config dumps, but the pipeline definition IS source:
+!pipelines/*.json
+
+# So are the Claude Code plugin manifests (README, References, "The skill"):
+!.claude-plugin/marketplace.json
+!plugins/**/.claude-plugin/plugin.json
+
+# Probe outputs and layout_stats pulls: local evidence, not source. LEARNING.md cites them by file
+# name; the numbers it quotes are in the text. The headline table lives at the repo root
+# (summary_<date>.csv, the results notebook's `layout` table) and is tracked.
+probe_results/
+
+# The white paper's companion repo (github.com/lipinght/DB-DQ-Whitepaper, MIT) was vendored here
+# until 2026-09-07. The Fabric notebooks embed what they need; fetch it locally only to rebuild
+# them or to deploy the paper's TMDL, and it never gets committed.
+paper/
+
+# fabric/pull_layout_stats.py download target
+scratch/

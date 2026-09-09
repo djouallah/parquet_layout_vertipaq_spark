@@ -1,0 +1,156 @@
+{
+ "properties": {
+  "activities": [
+   {
+    "name": "For each rung",
+    "type": "ForEach",
+    "dependsOn": [],
+    "typeProperties": {
+     "isSequential": true,
+     "items": {
+      "value": "@pipeline().parameters.ladder",
+      "type": "Expression"
+     },
+     "activities": [
+      {
+       "name": "Run benchmark",
+       "type": "TridentNotebook",
+       "dependsOn": [],
+       "policy": {
+        "timeout": "1.00:00:00",
+        "retry": 0,
+        "retryIntervalInSeconds": 30,
+        "secureInput": false,
+        "secureOutput": false
+       },
+       "typeProperties": {
+        "notebookId": "00000000-0000-0000-0000-000000000000",
+        "workspaceId": "00000000-0000-0000-0000-000000000000",
+        "parameters": {
+         "pipelinecore": {
+          "value": {
+           "value": "@item().cores",
+           "type": "Expression"
+          },
+          "type": "int"
+         },
+         "concurrent_threads": {
+          "value": {
+           "value": "@item().threads",
+           "type": "Expression"
+          },
+          "type": "int"
+         },
+         "iterations": {
+          "value": {
+           "value": "@item().iterations",
+           "type": "Expression"
+          },
+          "type": "int"
+         },
+         "models": {
+          "value": {
+           "value": "@pipeline().parameters.models",
+           "type": "Expression"
+          },
+          "type": "string"
+         },
+         "lh_name": {
+          "value": {
+           "value": "@pipeline().parameters.lh_name",
+           "type": "Expression"
+          },
+          "type": "string"
+         },
+         "nbr_queries": {
+          "value": {
+           "value": "@pipeline().parameters.nbr_queries",
+           "type": "Expression"
+          },
+          "type": "int"
+         },
+         "delay_sec": {
+          "value": {
+           "value": "@pipeline().parameters.delay_sec",
+           "type": "Expression"
+          },
+          "type": "int"
+         },
+         "sf": {
+          "value": {
+           "value": "@pipeline().parameters.sf",
+           "type": "Expression"
+          },
+          "type": "int"
+         },
+         "arms": {
+          "value": {
+           "value": "@pipeline().parameters.arms",
+           "type": "Expression"
+          },
+          "type": "string"
+         },
+         "runs": {
+          "value": {
+           "value": "@item().runs",
+           "type": "Expression"
+          },
+          "type": "int"
+         },
+         "results_table": {
+          "value": {
+           "value": "@pipeline().parameters.results_table",
+           "type": "Expression"
+          },
+          "type": "string"
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  ],
+  "parameters": {
+   "ladder": {
+    "type": "array",
+    "defaultValue": [
+     {
+      "cores": 8,
+      "threads": 20,
+      "iterations": 1,
+      "runs": 3
+     }
+    ]
+   },
+   "models": {
+    "type": "string",
+    "defaultValue": ""
+   },
+   "lh_name": {
+    "type": "string",
+    "defaultValue": "tpcds_bench"
+   },
+   "nbr_queries": {
+    "type": "int",
+    "defaultValue": 24
+   },
+   "delay_sec": {
+    "type": "int",
+    "defaultValue": 4
+   },
+   "sf": {
+    "type": "int",
+    "defaultValue": 1000
+   },
+   "arms": {
+    "type": "string",
+    "defaultValue": "default"
+   },
+   "results_table": {
+    "type": "string",
+    "defaultValue": "perfresults3"
+   }
+  }
+ }
+}
